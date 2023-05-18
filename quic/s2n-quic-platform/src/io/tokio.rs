@@ -58,6 +58,10 @@ impl Io {
 
         let clock = Clock::default();
 
+        let blocking_rx = std::env::var("S2N_UNSTABLE_BLOCKING_RX").is_ok();
+        let blocking_tx = std::env::var("S2N_UNSTABLE_BLOCKING_TX").is_ok();
+        let blocking_endpoint = std::env::var("S2N_UNSTABLE_BLOCKING_ENDPOINT").is_ok();
+
         let mut publisher = event::EndpointPublisherSubscriber::new(
             event::builder::EndpointMeta {
                 endpoint_type: E::ENDPOINT_TYPE,
@@ -171,7 +175,11 @@ impl Io {
             consumers.push(consumer);
 
             // spawn a task that actually reads from the socket into the ring buffer
-            handle.spawn(task::rx(rx_socket, producer));
+            if blocking_rx {
+                std::thread::spawn(|| crate::socket::task::blocking::rx(rx_socket, producer));
+            } else {
+                handle.spawn(task::rx(rx_socket, producer));
+            }
 
             // construct the RX side for the endpoint event loop
             let max_mtu = MaxMtu::try_from(payload_len as u16).unwrap();
@@ -205,7 +213,12 @@ impl Io {
             producers.push(producer);
 
             // spawn a task that actually flushes the ring buffer to the socket
-            handle.spawn(task::tx(tx_socket, consumer, gso.clone()));
+            if blocking_tx {
+                let gso = gso.clone();
+                std::thread::spawn(|| crate::socket::task::blocking::tx(tx_socket, consumer, gso));
+            } else {
+                handle.spawn(task::tx(tx_socket, consumer, gso.clone()));
+            }
 
             // construct the TX side for the endpoint event loop
             socket::io::tx::Tx::new(producers, gso, max_mtu)
@@ -214,15 +227,30 @@ impl Io {
         // Notify the endpoint of the MTU that we chose
         endpoint.set_max_mtu(max_mtu);
 
-        let task = handle.spawn(
-            EventLoop {
-                endpoint,
-                clock,
-                rx,
-                tx,
-            }
-            .start(),
-        );
+        let task = if blocking_endpoint {
+            std::thread::spawn(|| {
+                crate::socket::task::blocking::endpoint(|clock| {
+                    EventLoop {
+                        endpoint,
+                        clock,
+                        rx,
+                        tx,
+                    }
+                    .start()
+                })
+            });
+            handle.spawn(core::future::pending())
+        } else {
+            handle.spawn(
+                EventLoop {
+                    endpoint,
+                    clock,
+                    rx,
+                    tx,
+                }
+                .start(),
+            )
+        };
 
         drop(guard);
 
